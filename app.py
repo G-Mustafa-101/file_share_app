@@ -3,13 +3,14 @@ import sqlite3, os, time, hashlib
 from datetime import datetime, date, time as dtime
 from pathlib import Path
 from io import BytesIO
+from PIL import Image
 
 # ================= CONFIG =================
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 DB = "viral_file_share.db"
 
-# 🔐 ADMIN PASSWORD (HIDDEN)
+# 🔐 ADMIN PASSWORD
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") 
 
 # ================= DATABASE =================
@@ -24,13 +25,8 @@ CREATE TABLE IF NOT EXISTS files (
     password_hash TEXT,
     password_expiry INTEGER,
     view_seconds INTEGER,
-    one_time_view INTEGER,
-    one_time_download INTEGER,
     max_downloads INTEGER,
     download_count INTEGER DEFAULT 0,
-    viewed INTEGER DEFAULT 0,
-    upload_country TEXT,
-    download_country TEXT,
     upload_time TEXT,
     download_time TEXT
 )
@@ -92,15 +88,11 @@ if menu == "📤 Upload":
     expiry_time = st.time_input("⏰ Expiry Time", dtime(23, 59))
 
     if expiry_date < date.today():
-        st.warning("❌ Expiry date cannot be in the past. Please select today or a future date.")
-        st.stop()
+        st.warning("❌ Expiry date cannot be in the past."); st.stop()
 
     expiry_ts = int(datetime.combine(expiry_date, expiry_time).timestamp())
-    one_time_view = st.checkbox("👁 One-Time View")
-    view_sec = st.slider("⏱ View Seconds", 1, 600, 10) if one_time_view else 0
-
-    one_dl = int(st.checkbox("⬇ One-Time Download"))
-    max_dl = 1 if one_dl else st.number_input("Max Downloads", 1, 50, 3)
+    view_sec = 10  # default 10 seconds view before download
+    max_dl = st.number_input("Max Downloads", 1, 50, 3)
 
     file, text_data = None, None
     if utype == "File":
@@ -114,8 +106,10 @@ if menu == "📤 Upload":
 
     if st.button("🚀 Upload Securely"):
         if not (6 <= len(password) <= 10):
-            st.error("Password must be 6–10 characters")
-            st.stop()
+            st.error("Password must be 6–10 characters"); st.stop()
+        c.execute("SELECT * FROM files WHERE password_hash=?", (hash_pwd(password),))
+        if c.fetchone():
+            st.error("❌ Password already used. Please choose a different password."); st.stop()
 
         fname, fpath = None, None
         if utype == "File" and file:
@@ -126,20 +120,15 @@ if menu == "📤 Upload":
 
         c.execute("""
         INSERT INTO files (
-            id, filename, filepath, text_data, password_hash,
-            password_expiry, view_seconds, one_time_view, one_time_download,
-            max_downloads, download_count, viewed, upload_country,
-            download_country, upload_time, download_time
-        ) VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            filename, filepath, text_data, password_hash,
+            password_expiry, view_seconds, max_downloads,
+            upload_time
+        ) VALUES (?,?,?,?,?,?,?,?)
         """,
         (
             fname, str(fpath) if fpath else None, text_data,
             hash_pwd(password), expiry_ts,
-            view_sec, int(one_time_view),
-            int(one_dl), max_dl,
-            0, 0,
-            "Unknown", None,
-            str(datetime.now()), None
+            view_sec, max_dl, str(datetime.now())
         ))
         conn.commit()
         st.success("✅ Uploaded Successfully")
@@ -158,37 +147,40 @@ elif menu == "🔓 Access":
             st.error("❌ Invalid password"); st.stop()
         if expired(r[5]):
             st.error("⏰ Link expired"); st.stop()
-        if r[9] != 0 and r[10] >= r[9]:
+        if r[8] >= r[7]:
             st.error("⬇ Download limit reached"); st.stop()
 
-        # ✅ View Before Download Logic
-        if not r[11]:  # Not viewed yet
-            st.info(f"👁 You must view for {r[6]} seconds before download.")
-            if r[1] and os.path.exists(r[2]):
+        # Show 10-second view before download
+        countdown = st.empty()
+        content_displayed = False
+        if r[2] and os.path.exists(r[2]):
+            ext = r[1].split(".")[-1].lower()
+            if ext in ["png","jpg","jpeg","gif"]:
+                img = Image.open(r[2])
+                st.image(img, caption=r[1], width=700)
+                content_displayed = True
+            else:
                 with open(r[2], "r", encoding="utf-8", errors="ignore") as f:
                     st.text_area("📄 File Preview", f.read(), height=300)
-            else:
-                st.text_area("📝 Text View", r[3], height=300)
+                    content_displayed = True
+        elif r[3]:
+            st.text_area("📝 Text Preview", r[3], height=300)
+            content_displayed = True
 
-            countdown = st.empty()
+        if content_displayed:
             for i in range(r[6], 0, -1):
                 countdown.markdown(f"<h3 style='color:#fffa; text-align:center;'>⏱ Viewing ends in {i} seconds</h3>", unsafe_allow_html=True)
                 time.sleep(1)
             countdown.empty()
-            st.success("✅ View complete! You can now download.")
 
-            c.execute("UPDATE files SET viewed=1 WHERE id=?", (r[0],))
-            conn.commit()
-            r = list(r)
-            r[11] = 1  # Mark viewed in local variable
-
-        # DOWNLOAD
-        if r[1] and os.path.exists(r[2]):
+        # Download button
+        if r[2] and os.path.exists(r[2]):
             with open(r[2], "rb") as f:
                 st.download_button("⬇ Download File", f, file_name=r[1])
-        else:
+        elif r[3]:
             st.download_button("⬇ Download Text", r[3], file_name="text.txt")
 
+        # Update download count and time
         c.execute("UPDATE files SET download_count=download_count+1, download_time=? WHERE id=?", (str(datetime.now()), r[0]))
         conn.commit()
     st.markdown("</div>", unsafe_allow_html=True)
@@ -199,33 +191,41 @@ else:
     st.subheader("🛠 Admin Panel")
     ap = st.text_input("Admin Password", type="password")
     if ap == ADMIN_PASSWORD:
-        st.success("👑 Welcome Admin")
+        st.success("👑 Welcome Admin! Full access granted.")
         c.execute("SELECT * FROM files")
         for r in c.fetchall():
             with st.expander(f"📦 File ID {r[0]}"):
-                st.write("⏰ Upload Time:", r[14])
-                st.write("⏰ Download Time:", r[15] if r[15] else "-")
+                st.write("⏰ Upload Time:", r[9])
+                st.write("⏰ Download Time:", r[10] if r[10] else "-")
 
-                if r[1] and os.path.exists(r[2]):
-                    with open(r[2], "r", encoding="utf-8", errors="ignore") as f:
-                        st.text_area("📄 File Content", f.read(), height=300)
+                # Show content
+                if r[2] and os.path.exists(r[2]):
+                    ext = r[1].split(".")[-1].lower()
+                    if ext in ["png","jpg","jpeg","gif"]:
+                        img = Image.open(r[2])
+                        st.image(img, caption=r[1], width=700)
+                    else:
+                        with open(r[2], "r", encoding="utf-8", errors="ignore") as f:
+                            st.text_area("📄 File Content", f.read(), height=300)
                     with open(r[2], "rb") as f:
                         st.download_button("⬇ Admin Download", f, file_name=r[1])
-                else:
+                elif r[3]:
                     st.text_area("📝 Text Content", r[3], height=300)
+                    st.download_button("⬇ Admin Download", r[3], file_name="text.txt")
 
-                new_max_dl = st.number_input("Max Downloads", min_value=1, max_value=50, value=max(1, r[9]))
-                new_expiry = st.date_input("Expiry Date", datetime.fromtimestamp(r[5]).date())
-                new_time = st.time_input("Expiry Time", datetime.fromtimestamp(r[5]).time())
+                # Update settings
+                new_max_dl = st.number_input("Max Downloads", min_value=1, max_value=50, value=max(1, r[7]), key=f"md_{r[0]}")
+                new_expiry = st.date_input("Expiry Date", datetime.fromtimestamp(r[5]).date(), key=f"d_{r[0]}")
+                new_time = st.time_input("Expiry Time", datetime.fromtimestamp(r[5]).time(), key=f"t_{r[0]}")
                 expiry_ts = int(datetime.combine(new_expiry, new_time).timestamp())
-
                 if st.button("💾 Update Settings", key=f"upd_{r[0]}"):
                     c.execute("UPDATE files SET max_downloads=?, password_expiry=? WHERE id=?", (new_max_dl, expiry_ts, r[0]))
                     conn.commit()
                     st.success("✅ Updated")
 
+                # Delete manually
                 if st.button("🗑 Delete File/Text", key=f"del_{r[0]}"):
-                    if r[1] and os.path.exists(r[2]):
+                    if r[2] and os.path.exists(r[2]):
                         os.remove(r[2])
                     c.execute("DELETE FROM files WHERE id=?", (r[0],))
                     conn.commit()
